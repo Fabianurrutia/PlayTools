@@ -21,6 +21,18 @@ public class PlayKeychain: NSObject {
             NSLog("PC-DEBUG: \(logContent)")
         }
     }
+
+    // The real keychain assigns every item an access group ("<TeamID>.<bundleID>") and returns it
+    // as kSecAttrAccessGroup. A common iOS idiom adds a dummy item and reads that value back to
+    // derive the app's "bundle seed ID" (the part before the first '.'). PlayKeychain never
+    // assigns an access group, so those callers read nil and crash — e.g. ubiservices
+    // DeviceStorage::getDeviceId() -> -[NSString initWithString:nil]. Return a stable,
+    // deterministic synthetic value so the read is never nil.
+    static func syntheticAccessGroup() -> String {
+        let bundleID = Bundle.main.bundleIdentifier ?? "io.playcover.shared"
+        return "0000000000.\(bundleID)"
+    }
+
     // Emulates SecItemAdd, SecItemUpdate, SecItemDelete and SecItemCopyMatching
     // Store the entire dictionary as a plist
     // SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result)
@@ -43,6 +55,9 @@ public class PlayKeychain: NSObject {
                 dummyDict.removeObject(forKey: kSecValueData)
                 dummyDict.removeObject(forKey: kSecValueRef)
                 dummyDict.removeObject(forKey: kSecValuePersistentRef)
+            }
+            if dummyDict[kSecAttrAccessGroup as String] == nil {
+                dummyDict[kSecAttrAccessGroup as String] = syntheticAccessGroup()
             }
             result?.pointee = Unmanaged.passRetained(dummyDict)
             return errSecSuccess
@@ -140,6 +155,9 @@ public class PlayKeychain: NSObject {
                 dummyDict.removeObject(forKey: kSecValueData)
                 dummyDict.removeObject(forKey: kSecValueRef)
                 dummyDict.removeObject(forKey: kSecValuePersistentRef)
+            }
+            if dummyDict[kSecAttrAccessGroup as String] == nil {
+                dummyDict[kSecAttrAccessGroup as String] = syntheticAccessGroup()
             }
             result?.pointee = Unmanaged.passRetained(dummyDict)
             return errSecSuccess

@@ -32,7 +32,19 @@ static bool pt_trace_on(void) {
     if (cached < 0) { cached = (getenv("PLAYTOOLS_TRACE") != NULL) ? 1 : 0; }
     return cached == 1;
 }
-#define PT_TRACE(fmt, ...) do { if (pt_trace_on()) NSLog(@"PT-TRACE " fmt, ##__VA_ARGS__); } while (0)
+// Reentrancy guard: NSLog lazily initializes os_log by calling sysctl, which re-enters our
+// sysctl hook; logging again from there recursively locks os_log's dispatch_once and aborts
+// ("BUG IN CLIENT OF LIBDISPATCH: trying to lock recursively"). This thread-local flag turns
+// any trace emitted *while already logging* into a no-op, breaking that cycle — and keeps the
+// early libSystem/libxpc initializers (which probe sysctl before os_log is up) from crashing.
+static __thread int pt_in_trace = 0;
+#define PT_TRACE(fmt, ...) do { \
+    if (pt_trace_on() && !pt_in_trace) { \
+        pt_in_trace = 1; \
+        NSLog(@"PT-TRACE " fmt, ##__VA_ARGS__); \
+        pt_in_trace = 0; \
+    } \
+} while (0)
 
 // Define dyld_get_active_platform function for interpose
 int dyld_get_active_platform(void);
@@ -51,10 +63,8 @@ static int pt_uname(struct utsname *uts) {
 // changes; value is returned unmodified.
 static uint32_t pt_dyld_image_count(void) {
     uint32_t n = _dyld_image_count();
-    if (pt_trace_on()) {
-        static uint32_t last = 0xFFFFFFFFu;
-        if (n != last) { last = n; NSLog(@"PT-TRACE _dyld_image_count() = %u", n); }
-    }
+    static uint32_t last = 0xFFFFFFFFu;
+    if (n != last) { last = n; PT_TRACE(@"_dyld_image_count() = %u", n); }
     return n;
 }
 
@@ -62,8 +72,8 @@ static uint32_t pt_dyld_image_count(void) {
 // Update output of sysctl for key values hw.machine, hw.product and hw.target to match iOS output
 // This spoofs the device type to apps allowing us to report as any iOS device
 static int pt_sysctl(int *name, u_int types, void *buf, size_t *size, void *arg0, size_t arg1) {
-    if (pt_trace_on() && (name[0] == CTL_HW || name[0] == CTL_KERN)) {
-        NSLog(@"PT-TRACE sysctl mib[0]=%d mib[1]=%d", name[0], name[1]);
+    if (name[0] == CTL_HW || name[0] == CTL_KERN) {
+        PT_TRACE(@"sysctl mib[0]=%d mib[1]=%d", name[0], name[1]);
     }
     if (name[0] == CTL_HW && (name[1] == HW_MACHINE || name[1] == HW_PRODUCT)) {
         if (NULL == buf) {
