@@ -6,6 +6,10 @@
 #include <Foundation/Foundation.h>
 #include <errno.h>
 #include <sys/sysctl.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdarg.h>
+#include <stdio.h>
 
 #import "PlayLoader.h"
 #import <PlayTools/PlayTools-Swift.h>
@@ -26,25 +30,55 @@
 // environment counts/probes that injected SDKs and anti-cheat code read at runtime. Additive
 // only: every traced hook returns the real, unmodified result. Goal: find which value differs
 // between iOS and macOS/PlayCover (loaded-image count, sysctl probes, ...) so a targeted fix
-// can be made instead of guessing. Logs are visible in Console.app filtered by "PT-TRACE".
+// can be made instead of guessing.
+//
+// IMPORTANT: these hooks fire during the dyld initializer phase, *before* libxpc/os_log are
+// ready (libxpc itself calls sysctlbyname from _libxpc_initializer to read the OS version).
+// NSLog there reaches into not-yet-initialized xpc and segfaults. So PT_TRACE must avoid
+// CoreFoundation/Foundation/os_log entirely: it formats into a stack buffer with vsnprintf and
+// emits the bytes with a single write(2) to a plain file. open()/write() are bare syscalls,
+// safe at any point in startup.
+//
+// The host app is App-Sandboxed, so the log can't go to /tmp — it goes to the app container,
+// i.e. $HOME/playtools-trace.log (HOME = .../Containers/<bundleid>/Data for a sandboxed app).
+// Falls back to /tmp for non-sandboxed contexts. getenv("HOME") is just an env read — init-safe.
+#define PT_TRACE_FILENAME "/playtools-trace.log"
 static bool pt_trace_on(void) {
     static int cached = -1;
     if (cached < 0) { cached = (getenv("PLAYTOOLS_TRACE") != NULL) ? 1 : 0; }
     return cached == 1;
 }
-// Reentrancy guard: NSLog lazily initializes os_log by calling sysctl, which re-enters our
-// sysctl hook; logging again from there recursively locks os_log's dispatch_once and aborts
-// ("BUG IN CLIENT OF LIBDISPATCH: trying to lock recursively"). This thread-local flag turns
-// any trace emitted *while already logging* into a no-op, breaking that cycle — and keeps the
-// early libSystem/libxpc initializers (which probe sysctl before os_log is up) from crashing.
-static __thread int pt_in_trace = 0;
-#define PT_TRACE(fmt, ...) do { \
-    if (pt_trace_on() && !pt_in_trace) { \
-        pt_in_trace = 1; \
-        NSLog(@"PT-TRACE " fmt, ##__VA_ARGS__); \
-        pt_in_trace = 0; \
-    } \
-} while (0)
+__attribute__((format(printf, 1, 2)))
+static void pt_trace_write(const char *fmt, ...) {
+    if (!pt_trace_on()) return;
+    // Lazily open an append-mode fd. The race between threads on first call is benign: at worst
+    // two fds leak, and O_APPEND keeps each small write atomically positioned at end-of-file.
+    static int fd = -1;
+    if (fd < 0) {
+        char path[1024];
+        const char *home = getenv("HOME");
+        if (home && home[0]) {
+            snprintf(path, sizeof(path), "%s%s", home, PT_TRACE_FILENAME);
+        } else {
+            snprintf(path, sizeof(path), "/tmp%s", PT_TRACE_FILENAME);
+        }
+        int f = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (f < 0) return;
+        fd = f;
+    }
+    char buf[1024];
+    int prefix = snprintf(buf, sizeof(buf), "PT-TRACE ");
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + prefix, sizeof(buf) - prefix - 1, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    int total = prefix + n;
+    if (total > (int)sizeof(buf) - 1) total = sizeof(buf) - 1;
+    buf[total++] = '\n';
+    (void)write(fd, buf, total);
+}
+#define PT_TRACE(fmt, ...) pt_trace_write(fmt, ##__VA_ARGS__)
 
 // Define dyld_get_active_platform function for interpose
 int dyld_get_active_platform(void);
@@ -64,7 +98,7 @@ static int pt_uname(struct utsname *uts) {
 static uint32_t pt_dyld_image_count(void) {
     uint32_t n = _dyld_image_count();
     static uint32_t last = 0xFFFFFFFFu;
-    if (n != last) { last = n; PT_TRACE(@"_dyld_image_count() = %u", n); }
+    if (n != last) { last = n; PT_TRACE("_dyld_image_count() = %u", n); }
     return n;
 }
 
@@ -73,7 +107,7 @@ static uint32_t pt_dyld_image_count(void) {
 // This spoofs the device type to apps allowing us to report as any iOS device
 static int pt_sysctl(int *name, u_int types, void *buf, size_t *size, void *arg0, size_t arg1) {
     if (name[0] == CTL_HW || name[0] == CTL_KERN) {
-        PT_TRACE(@"sysctl mib[0]=%d mib[1]=%d", name[0], name[1]);
+        PT_TRACE("sysctl mib[0]=%d mib[1]=%d", name[0], name[1]);
     }
     if (name[0] == CTL_HW && (name[1] == HW_MACHINE || name[1] == HW_PRODUCT)) {
         if (NULL == buf) {
@@ -103,7 +137,7 @@ static int pt_sysctl(int *name, u_int types, void *buf, size_t *size, void *arg0
 }
 
 static int pt_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    PT_TRACE(@"sysctlbyname(%s)", name);
+    PT_TRACE("sysctlbyname(%s)", name);
     if ((strcmp(name, "hw.machine") == 0) || (strcmp(name, "hw.product") == 0) || (strcmp(name, "hw.model") == 0)) {
         if (oldp == NULL) {
             *oldlenp = strlen(DEVICE_MODEL) + 1;
