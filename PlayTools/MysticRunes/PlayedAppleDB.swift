@@ -24,8 +24,9 @@ class PlayKeychainDB: NSObject {
         let selectWhere = primaryColumns.compactMap({
             guard let attr = attributes[$0] else { return nil } // use only requested ones
             if CFGetTypeID(attr as CFTypeRef) == CFDataGetTypeID(),
-               let string = (attr as? Data).map({ String(data: $0, encoding: .utf8) }) {
-                return "\($0) LIKE '\(string!)'" // non null-termination in db
+               let data = attr as? Data,
+               let string = String(data: data, encoding: .utf8) {
+                return "\($0) LIKE '\(string)'" // non null-termination in db
             }
             return "\($0) = '\(attr)'"
         }).joined(separator: " AND ")
@@ -138,8 +139,9 @@ class PlayKeychainDB: NSObject {
         let updateWhere = primaryColumns.compactMap({
             guard let attr = attributes[$0] else { return nil }
             if CFGetTypeID(attr as CFTypeRef) == CFDataGetTypeID(),
-               let string = (attr as? Data).map({ return String(data: $0, encoding: .utf8) }) {
-                return "\($0) LIKE '\(string!)'" // \0 does not exists in db due to casting
+               let data = attr as? Data,
+               let string = String(data: data, encoding: .utf8) {
+                return "\($0) LIKE '\(string)'" // \0 does not exists in db due to casting
             }
             return "\($0) = '\(attr)'"
         }).joined(separator: " AND ")
@@ -179,8 +181,9 @@ class PlayKeychainDB: NSObject {
         let deleteWhere = primaryColumns.compactMap({
             guard let attr = attributes[$0] else { return nil } // use only requested ones
             if CFGetTypeID(attr as CFTypeRef) == CFDataGetTypeID(),
-               let string = (attr as? Data).map({ return String(data: $0, encoding: .utf8) }) {
-                return "\($0) LIKE '\(string!)'" // non null-termination in db
+               let data = attr as? Data,
+               let string = String(data: data, encoding: .utf8) {
+                return "\($0) LIKE '\(string)'" // non null-termination in db
             }
             return "\($0) = '\(attr)'"
         }).joined(separator: " AND ")
@@ -242,7 +245,10 @@ class PlayKeychainDB: NSObject {
             .appendingPathComponent("PlayChain")
             .appendingPathComponent("\(bundleID).db")
 
-        let alreadyCreated = FileManager.default.fileExists(atPath: keychainDB.path)
+        // sqlite3_open() fails with SQLITE_CANTOPEN if the parent directory is missing,
+        // so make sure PlayChain/ exists before opening.
+        try? FileManager.default.createDirectory(at: keychainDB.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
 
         guard sqlite3_open(keychainDB.path, &sqlite3DB) == SQLITE_OK,
               let sqlite3DB = sqlite3DB else {
@@ -250,7 +256,12 @@ class PlayKeychainDB: NSObject {
             return nil
         }
 
-        if !alreadyCreated || !structDB(sqlite3DB) {
+        // Always ensure the schema exists. sqlite3_open() creates an empty file on first use,
+        // so the tables must be (re)created on every connect; CREATE TABLE IF NOT EXISTS is
+        // idempotent. The previous `!alreadyCreated` short-circuit skipped structDB() on the
+        // very first launch and returned nil, so the device-id write failed and getDeviceId()
+        // crashed with -[NSString initWithString:nil].
+        guard structDB(sqlite3DB) else {
             _ = disconnectFromDB(sqlite3DB)
             return nil
         }
@@ -293,7 +304,11 @@ class PlayKeychainDB: NSObject {
         switch sqlite3_column_type(stmt, index) {
         case SQLITE_TEXT:
             guard let ptr = sqlite3_column_text(stmt, index) else { return nil }
-            return CFStringCreateWithCString(nil, ptr, kCFStringEncodingASCII)
+            // Prefer UTF-8; fall back to ASCII only if that fails. ASCII-only returns NULL for
+            // any byte >= 0x80, which would silently drop the value and make a round-tripped
+            // item look "not found" (one cause of the getDeviceId() nil crash).
+            return CFStringCreateWithCString(nil, ptr, CFStringBuiltInEncodings.UTF8.rawValue)
+                ?? CFStringCreateWithCString(nil, ptr, kCFStringEncodingASCII)
         case SQLITE_BLOB:
             guard let ptr = sqlite3_column_blob(stmt, index) else { return nil }
             let size = sqlite3_column_bytes(stmt, index)

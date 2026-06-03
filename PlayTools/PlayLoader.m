@@ -21,6 +21,19 @@
 #define OEM_ID [[[PlaySettings shared] oemID] cStringUsingEncoding:NSUTF8StringEncoding]
 #define PLATFORM_IOS 2
 
+// --- Opt-in diagnostics (PT_TRACE) ---------------------------------------------------------
+// Set the PLAYTOOLS_TRACE environment variable (e.g. via the app's LSEnvironment) to log the
+// environment counts/probes that injected SDKs and anti-cheat code read at runtime. Additive
+// only: every traced hook returns the real, unmodified result. Goal: find which value differs
+// between iOS and macOS/PlayCover (loaded-image count, sysctl probes, ...) so a targeted fix
+// can be made instead of guessing. Logs are visible in Console.app filtered by "PT-TRACE".
+static bool pt_trace_on(void) {
+    static int cached = -1;
+    if (cached < 0) { cached = (getenv("PLAYTOOLS_TRACE") != NULL) ? 1 : 0; }
+    return cached == 1;
+}
+#define PT_TRACE(fmt, ...) do { if (pt_trace_on()) NSLog(@"PT-TRACE " fmt, ##__VA_ARGS__); } while (0)
+
 // Define dyld_get_active_platform function for interpose
 int dyld_get_active_platform(void);
 int pt_dyld_get_active_platform(void) { return PLATFORM_IOS; }
@@ -33,11 +46,26 @@ static int pt_uname(struct utsname *uts) {
     return 0;
 }
 
+// Loaded Mach-O image count. Prime suspect for anti-cheat buffers sized for an iOS-typical
+// image list but then iterated over the (larger) macOS/Catalyst one. Logged only when it
+// changes; value is returned unmodified.
+static uint32_t pt_dyld_image_count(void) {
+    uint32_t n = _dyld_image_count();
+    if (pt_trace_on()) {
+        static uint32_t last = 0xFFFFFFFFu;
+        if (n != last) { last = n; NSLog(@"PT-TRACE _dyld_image_count() = %u", n); }
+    }
+    return n;
+}
+
 
 // Update output of sysctl for key values hw.machine, hw.product and hw.target to match iOS output
 // This spoofs the device type to apps allowing us to report as any iOS device
 static int pt_sysctl(int *name, u_int types, void *buf, size_t *size, void *arg0, size_t arg1) {
-    if (name[0] == CTL_HW && (name[1] == HW_MACHINE || name[0] == HW_PRODUCT)) {
+    if (pt_trace_on() && (name[0] == CTL_HW || name[0] == CTL_KERN)) {
+        NSLog(@"PT-TRACE sysctl mib[0]=%d mib[1]=%d", name[0], name[1]);
+    }
+    if (name[0] == CTL_HW && (name[1] == HW_MACHINE || name[1] == HW_PRODUCT)) {
         if (NULL == buf) {
             *size = strlen(DEVICE_MODEL) + 1;
         } else {
@@ -65,6 +93,7 @@ static int pt_sysctl(int *name, u_int types, void *buf, size_t *size, void *arg0
 }
 
 static int pt_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    PT_TRACE(@"sysctlbyname(%s)", name);
     if ((strcmp(name, "hw.machine") == 0) || (strcmp(name, "hw.product") == 0) || (strcmp(name, "hw.model") == 0)) {
         if (oldp == NULL) {
             *oldlenp = strlen(DEVICE_MODEL) + 1;
@@ -106,6 +135,7 @@ DYLD_INTERPOSE(pt_dyld_get_active_platform, dyld_get_active_platform)
 DYLD_INTERPOSE(pt_uname, uname)
 DYLD_INTERPOSE(pt_sysctlbyname, sysctlbyname)
 DYLD_INTERPOSE(pt_sysctl, sysctl)
+DYLD_INTERPOSE(pt_dyld_image_count, _dyld_image_count)
 
 // Interpose Apple Keychain functions (SecItemCopyMatching, SecItemAdd, SecItemUpdate, SecItemDelete)
 // This allows us to intercept keychain requests and return our own data
