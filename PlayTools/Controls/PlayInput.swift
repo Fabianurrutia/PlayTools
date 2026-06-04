@@ -115,25 +115,9 @@ enum WebTextInputBridge {
     // Returns true only when the keystroke was inserted into a non-native text responder,
     // signalling AKInterface to consume the event. Returns false otherwise (pass-through).
     static func handle(text: String, keyCode: UInt16) -> Bool {
-        let responderOpt = UIResponder.ptCurrentFirstResponder
-        // Dump the responder chain (classes only) to see what, if anything, is focused.
-        var chain: [String] = []
-        var cursor: UIResponder? = responderOpt
-        var hops = 0
-        while let cur = cursor, hops < 8 {
-            chain.append(String(describing: type(of: cur)))
-            cursor = cur.next
-            hops += 1
-        }
-        log("key=\(keyCode) len=\(text.count) keyInput=\(responderOpt is UIKeyInput) "
-            + "chain=[\(chain.joined(separator: " > "))]")
-
-        guard let responder = responderOpt,
-              let keyInput = responder as? UIKeyInput,
-              !(responder is UITextField),
-              !(responder is UITextView) else {
-            return false
-        }
+        let target = focusedKeyInput()
+        log("key=\(keyCode) len=\(text.count) target=\(target?.name ?? "none")")
+        guard let keyInput = target?.input else { return false }
 
         switch keyCode {
         case 51: // delete / backspace
@@ -150,6 +134,33 @@ enum WebTextInputBridge {
             keyInput.insertText(text)
             return true
         }
+    }
+
+    // Resolves the live text-input target. A native UITextField/UITextView already gets the
+    // keyboard through the responder chain, so it's intentionally skipped here. For a web login
+    // the first responder is the outer WKWebView (which is not a UIKeyInput); the editable object
+    // is its WKContentView descendant, which conforms to UIKeyInput — so descend to find it.
+    static func focusedKeyInput() -> (input: UIKeyInput, name: String)? {
+        guard let responder = UIResponder.ptCurrentFirstResponder else { return nil }
+        if let keyInput = responder as? UIKeyInput,
+           !(responder is UITextField), !(responder is UITextView) {
+            return (keyInput, String(describing: type(of: responder)))
+        }
+        if let view = responder as? UIView {
+            return findWebKeyInput(in: view)
+        }
+        return nil
+    }
+
+    private static func findWebKeyInput(in view: UIView) -> (input: UIKeyInput, name: String)? {
+        let name = String(describing: type(of: view))
+        if name.contains("WKContentView"), let keyInput = view as? UIKeyInput {
+            return (keyInput, name)
+        }
+        for sub in view.subviews {
+            if let found = findWebKeyInput(in: sub) { return found }
+        }
+        return nil
     }
 }
 
