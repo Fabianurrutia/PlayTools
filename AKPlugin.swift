@@ -187,6 +187,29 @@ class AKPlugin: NSObject, Plugin {
         })
     }
 
+    // Bridge the hardware keyboard into focused text inputs that Catalyst doesn't route to
+    // (notably WKWebView form fields, e.g. in-app web logins). This monitor is installed
+    // unconditionally — independent of keymapping — and only consumes the event when the
+    // PlayTools-side handler reports it actually inserted text into such a field. For everything
+    // else it returns the event untouched, so games, shortcuts, and native fields are unaffected.
+    func setupKeyWindowTextInput(_ handler: @escaping (String, UInt16, Bool) -> Bool) {
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { event in
+            if event.modifierFlags.contains(.command) {
+                // Bridge paste (Cmd+V) into web inputs that don't accept it natively.
+                if event.charactersIgnoringModifiers?.lowercased() == "v" {
+                    let pasted = NSPasteboard.general.string(forType: .string) ?? ""
+                    if !pasted.isEmpty, handler(pasted, event.keyCode, false) {
+                        return nil
+                    }
+                }
+                return event
+            }
+            let text = event.characters ?? ""
+            let consumed = handler(text, event.keyCode, event.isARepeat)
+            return consumed ? nil : event
+        })
+    }
+
     func setupMouseMoved(_ mouseMoved: @escaping (CGFloat, CGFloat) -> Bool) {
         let mask: NSEvent.EventTypeMask = [.leftMouseDragged, .otherMouseDragged, .rightMouseDragged]
         NSEvent.addLocalMonitorForEvents(matching: mask, handler: { event in
