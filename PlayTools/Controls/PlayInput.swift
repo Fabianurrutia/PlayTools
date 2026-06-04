@@ -86,8 +86,27 @@ class PlayInput {
 // untouched to avoid double input. The AKInterface monitor that drives this is installed
 // unconditionally, so this works even when keymapping is disabled.
 enum WebTextInputBridge {
+    // Diagnostic logger: appends to ~/wtib.log (real home for the sandboxed app) and NSLog.
+    // Never logs typed text content — only key codes and responder classes.
+    static func log(_ msg: String) {
+        NSLog("WTIB %@", msg)
+        let path = (NSHomeDirectory() as NSString).appendingPathComponent("wtib.log")
+        guard let data = (msg + "\n").data(using: .utf8) else { return }
+        if let handle = FileHandle(forWritingAtPath: path) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        } else {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
+    }
+
     static func setup() {
-        guard let plugin = AKInterface.shared else { return }
+        guard let plugin = AKInterface.shared else {
+            log("setup: AKInterface.shared is nil")
+            return
+        }
+        log("setup: installing keyDown monitor")
         plugin.setupKeyWindowTextInput { text, keyCode, _ in
             WebTextInputBridge.handle(text: text, keyCode: keyCode)
         }
@@ -96,7 +115,20 @@ enum WebTextInputBridge {
     // Returns true only when the keystroke was inserted into a non-native text responder,
     // signalling AKInterface to consume the event. Returns false otherwise (pass-through).
     static func handle(text: String, keyCode: UInt16) -> Bool {
-        guard let responder = UIResponder.ptCurrentFirstResponder,
+        let responderOpt = UIResponder.ptCurrentFirstResponder
+        // Dump the responder chain (classes only) to see what, if anything, is focused.
+        var chain: [String] = []
+        var cursor: UIResponder? = responderOpt
+        var hops = 0
+        while let cur = cursor, hops < 8 {
+            chain.append(String(describing: type(of: cur)))
+            cursor = cur.next
+            hops += 1
+        }
+        log("key=\(keyCode) len=\(text.count) keyInput=\(responderOpt is UIKeyInput) "
+            + "chain=[\(chain.joined(separator: " > "))]")
+
+        guard let responder = responderOpt,
               let keyInput = responder as? UIKeyInput,
               !(responder is UITextField),
               !(responder is UITextView) else {
